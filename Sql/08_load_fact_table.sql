@@ -1,108 +1,148 @@
 /* ============================================================================
    NEXORA SUPPLY CHAIN ANALYTICS PLATFORM
    File          : 08_load_fact_table.sql
-   Purpose       : Load the central order-item fact table from staging.
+   Purpose       : Load the validated staging dataset into fact_order_item.
    Compatibility : MySQL 8.0+ / MySQL Workbench
 
-   FACT GRAIN
-   One row = one source order_item_id.
+   Grain:
+   - One row represents one order item.
 
-   ETL CHARACTERISTICS
-   - Idempotent: rerunning updates existing order-item facts.
-   - Dimension lookup failures resolve to Unknown key 0.
-   - Duplicate staging order_item_id values are deduplicated using the latest
-     staging row.
-   - Source-to-target row counts and surrogate-key coverage are validated.
+   Prerequisites:
+   - 03_load_csv_header_aligned.sql completed successfully.
+   - 04_data_quality_check_final.sql returned READY.
+   - 05_create_dimension_tables.sql completed successfully.
+   - 06_load_dimension_tables.sql returned READY FOR FACT LOAD.
+   - 07_create_fact_table.sql completed successfully.
+
+   Load strategy:
+   - Full refresh of fact_order_item.
+   - Uses the latest staging load_batch_id.
+   - Resolves natural keys to dimension surrogate keys.
+   - Falls back to Unknown key 0 only when a dimension cannot be resolved.
    ============================================================================ */
 
 USE nexora_supply_chain;
 
-SET SESSION sql_mode =
-    'STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION';
+SET SESSION time_zone = '+00:00';
 
-SET @fact_load_started_at = NOW(6);
+-- Preserve and temporarily disable Workbench Safe Updates for ETL operations.
+SET @previous_sql_safe_updates = @@SQL_SAFE_UPDATES;
+SET SQL_SAFE_UPDATES = 0;
 
-/* ---------------------------------------------------------------------------
-   1. PRE-LOAD VALIDATION
-   --------------------------------------------------------------------------- */
-SELECT
-    'staging_rows' AS metric,
-    COUNT(*) AS metric_value
-FROM stg_supply_chain
-
-UNION ALL
-
-SELECT
-    'staging_distinct_order_item_id',
-    COUNT(DISTINCT order_item_id)
-FROM stg_supply_chain
-WHERE order_item_id IS NOT NULL
-
-UNION ALL
-
-SELECT
-    'staging_null_order_item_id',
-    COUNT(*)
-FROM stg_supply_chain
-WHERE order_item_id IS NULL
-
-UNION ALL
-
-SELECT
-    'duplicate_order_item_id_groups',
-    COUNT(*)
-FROM (
-    SELECT order_item_id
+-- ============================================================================
+-- 1. IDENTIFY THE LATEST VALID STAGING BATCH
+-- ============================================================================
+SET @latest_batch_id = (
+    SELECT load_batch_id
     FROM stg_supply_chain
-    WHERE order_item_id IS NOT NULL
-    GROUP BY order_item_id
-    HAVING COUNT(*) > 1
-) AS duplicate_groups;
+    WHERE load_batch_id IS NOT NULL
+    ORDER BY loaded_at DESC
+    LIMIT 1
+);
 
-/* Every dimension must contain the Unknown member key 0. */
+SET @source_file_name = (
+    SELECT source_file_name
+    FROM stg_supply_chain
+    WHERE load_batch_id = @latest_batch_id
+    ORDER BY loaded_at DESC
+    LIMIT 1
+);
+
+SET @expected_rows = 180519;
+SET @started_at = NOW(6);
+
 SELECT
-    'dim_customer' AS dimension_name,
-    SUM(customer_key = 0) AS unknown_member_count
-FROM dim_customer
-UNION ALL
-SELECT 'dim_product', SUM(product_key = 0) FROM dim_product
-UNION ALL
-SELECT 'dim_category', SUM(category_key = 0) FROM dim_category
-UNION ALL
-SELECT 'dim_date', SUM(date_key = 0) FROM dim_date
-UNION ALL
-SELECT 'dim_shipping_mode', SUM(shipping_mode_key = 0) FROM dim_shipping_mode
-UNION ALL
-SELECT 'dim_geography', SUM(geography_key = 0) FROM dim_geography;
+    @latest_batch_id AS latest_batch_id,
+    @source_file_name AS source_file_name,
+    COUNT(*) AS staging_rows,
+    COUNT(DISTINCT order_item_id) AS staging_unique_order_items,
+    COUNT(order_date) AS valid_order_dates,
+    COUNT(shipping_date) AS valid_shipping_dates
+FROM stg_supply_chain
+WHERE load_batch_id = @latest_batch_id;
 
-/* ---------------------------------------------------------------------------
-   2. START ETL AUDIT
-   --------------------------------------------------------------------------- */
+-- ============================================================================
+-- 2. PRE-LOAD DIMENSION RESOLUTION CHECK
+-- All unresolved counts should be 0 before continuing.
+-- ============================================================================
+SELECT
+    SUM(c.customer_key IS NULL) AS unresolved_customers,
+    SUM(p.product_key IS NULL) AS unresolved_products,
+    SUM(cat.category_key IS NULL) AS unresolved_categories,
+    SUM(od.date_key IS NULL) AS unresolved_order_dates,
+    SUM(sd.date_key IS NULL) AS unresolved_shipping_dates,
+    SUM(sm.shipping_mode_key IS NULL) AS unresolved_shipping_modes,
+    SUM(g.geography_key IS NULL) AS unresolved_geographies,
+    CASE
+        WHEN
+            SUM(c.customer_key IS NULL) = 0
+            AND SUM(p.product_key IS NULL) = 0
+            AND SUM(cat.category_key IS NULL) = 0
+            AND SUM(od.date_key IS NULL) = 0
+            AND SUM(sd.date_key IS NULL) = 0
+            AND SUM(sm.shipping_mode_key IS NULL) = 0
+            AND SUM(g.geography_key IS NULL) = 0
+        THEN 'PASS'
+        ELSE 'REVIEW BEFORE FACT LOAD'
+    END AS dimension_resolution_status
+FROM stg_supply_chain AS s
+LEFT JOIN dim_customer AS c
+    ON c.customer_id = s.customer_id
+LEFT JOIN dim_product AS p
+    ON p.product_card_id = s.product_card_id
+LEFT JOIN dim_category AS cat
+    ON cat.category_id = s.category_id
+LEFT JOIN dim_date AS od
+    ON od.full_date = DATE(s.order_date)
+LEFT JOIN dim_date AS sd
+    ON sd.full_date = DATE(s.shipping_date)
+LEFT JOIN dim_shipping_mode AS sm
+    ON sm.shipping_mode = s.shipping_mode
+LEFT JOIN dim_geography AS g
+    ON g.geography_natural_key = SHA2(
+        CONCAT_WS(
+            '|',
+            COALESCE(TRIM(s.market), 'Unknown'),
+            COALESCE(TRIM(s.order_region), 'Unknown'),
+            COALESCE(TRIM(s.order_country), 'Unknown'),
+            COALESCE(TRIM(s.order_state), 'Unknown'),
+            COALESCE(TRIM(s.order_city), 'Unknown'),
+            COALESCE(CAST(ROUND(s.latitude, 6) AS CHAR), 'Unknown'),
+            COALESCE(CAST(ROUND(s.longitude, 6) AS CHAR), 'Unknown')
+        ),
+        256
+    )
+WHERE s.load_batch_id = @latest_batch_id;
+
+-- ============================================================================
+-- 3. CREATE ETL AUDIT RECORD
+-- ============================================================================
 INSERT INTO etl_run_log (
     pipeline_name,
     source_file_name,
     process_name,
     process_status,
-    rows_read,
     started_at
 )
-SELECT
+VALUES (
     'nexora_supply_chain_pipeline',
-    COALESCE(MAX(source_file_name), 'stg_supply_chain'),
+    @source_file_name,
     'load_fact_order_item',
     'STARTED',
-    COUNT(*),
-    @fact_load_started_at
-FROM stg_supply_chain;
+    @started_at
+);
 
 SET @etl_run_id = LAST_INSERT_ID();
 
-START TRANSACTION;
+-- ============================================================================
+-- 4. FULL-REFRESH FACT TABLE
+-- ============================================================================
+TRUNCATE TABLE fact_order_item;
 
-/* ---------------------------------------------------------------------------
-   3. LOAD FACT TABLE
-   The latest staging record wins when duplicate order_item_id values exist.
-   --------------------------------------------------------------------------- */
+-- ============================================================================
+-- 5. LOAD FACT_ORDER_ITEM
+-- ============================================================================
 INSERT INTO fact_order_item (
     customer_key,
     product_key,
@@ -118,25 +158,29 @@ INSERT INTO fact_order_item (
     order_item_cardprod_id,
 
     payment_type,
-    order_status,
     delivery_status,
-    delivery_performance,
-    profitability_status,
-    operational_risk_segment,
+    order_status,
 
     order_item_quantity,
     sales,
-    gross_sales_before_discount,
+    sales_per_customer,
+    order_item_total,
+    order_item_product_price,
+    product_price,
+
     order_item_discount,
     order_item_discount_rate,
-    discount_rate_pct,
     discount_pct_calculated,
-    order_item_product_price,
-    order_item_total,
+    discount_rate_pct,
+    gross_sales_before_discount,
+
     order_profit,
     order_profit_per_order,
     order_item_profit_ratio,
     profit_margin_pct,
+    profitability_status,
+    is_profitable_item,
+    is_loss_item,
 
     days_for_shipping_real,
     days_for_shipment_scheduled,
@@ -147,15 +191,9 @@ INSERT INTO fact_order_item (
     late_delivery_risk,
     is_late_delivery,
     is_on_time_delivery,
-    is_profitable_item,
-    is_loss_item,
-    requires_management_attention,
-
+    delivery_performance,
     delivery_delay_severity,
     shipping_speed_segment,
-    sales_value_tier,
-    margin_band,
-    discount_band,
 
     order_total_sales,
     order_total_profit,
@@ -163,486 +201,377 @@ INSERT INTO fact_order_item (
     order_item_count,
     order_profit_margin_pct,
 
-    source_staging_row_id,
+    customer_order_count,
+    customer_lifetime_sales,
+    customer_average_item_sales,
+    customer_lifetime_profit,
+    customer_tenure_days,
+    customer_frequency_segment,
+
+    sales_value_tier,
+    margin_band,
+    discount_band,
+    requires_management_attention,
+    operational_risk_segment,
+
     source_file_name,
     load_batch_id,
-    warehouse_loaded_at
+    staging_row_id,
+    loaded_at
 )
 SELECT
-    COALESCE(dc.customer_key, 0) AS customer_key,
-    COALESCE(dp.product_key, 0) AS product_key,
-    COALESCE(dcat.category_key, 0) AS category_key,
-    COALESCE(dod.date_key, 0) AS order_date_key,
-    COALESCE(dsd.date_key, 0) AS shipping_date_key,
-    COALESCE(dsm.shipping_mode_key, 0) AS shipping_mode_key,
-    COALESCE(dg.geography_key, 0) AS geography_key,
+    COALESCE(c.customer_key, 0) AS customer_key,
+    COALESCE(p.product_key, 0) AS product_key,
+    COALESCE(cat.category_key, 0) AS category_key,
+    COALESCE(od.date_key, 0) AS order_date_key,
+    COALESCE(sd.date_key, 0) AS shipping_date_key,
+    COALESCE(sm.shipping_mode_key, 0) AS shipping_mode_key,
+    COALESCE(g.geography_key, 0) AS geography_key,
 
-    src.order_item_id,
-    src.order_id,
-    src.order_customer_id,
-    src.order_item_cardprod_id,
+    s.order_item_id,
+    s.order_id,
+    s.order_customer_id,
+    s.order_item_cardprod_id,
 
-    src.payment_type,
-    src.order_status,
-    src.delivery_status,
-    src.delivery_performance,
-    src.profitability_status,
-    src.operational_risk_segment,
+    s.payment_type,
+    s.delivery_status,
+    s.order_status,
 
-    src.order_item_quantity,
-    src.sales,
-    src.gross_sales_before_discount,
-    src.order_item_discount,
-    src.order_item_discount_rate,
-    src.discount_rate_pct,
-    src.discount_pct_calculated,
-    src.order_item_product_price,
-    src.order_item_total,
-    src.order_profit,
-    src.order_profit_per_order,
-    src.order_item_profit_ratio,
-    src.profit_margin_pct,
+    s.order_item_quantity,
+    s.sales,
+    s.sales_per_customer,
+    s.order_item_total,
+    s.order_item_product_price,
+    s.product_price,
 
-    src.days_for_shipping_real,
-    src.days_for_shipment_scheduled,
-    src.shipping_delay_days,
-    src.absolute_schedule_variance_days,
-    src.shipping_efficiency_ratio,
+    s.order_item_discount,
+    s.order_item_discount_rate,
+    s.discount_pct_calculated,
+    s.discount_rate_pct,
+    s.gross_sales_before_discount,
 
-    src.late_delivery_risk,
-    src.is_late_delivery,
-    src.is_on_time_delivery,
-    src.is_profitable_item,
-    src.is_loss_item,
-    src.requires_management_attention,
+    s.order_profit,
+    s.order_profit_per_order,
+    s.order_item_profit_ratio,
+    s.profit_margin_pct,
+    s.profitability_status,
+    s.is_profitable_item,
+    s.is_loss_item,
 
-    src.delivery_delay_severity,
-    src.shipping_speed_segment,
-    src.sales_value_tier,
-    src.margin_band,
-    src.discount_band,
+    s.days_for_shipping_real,
+    s.days_for_shipment_scheduled,
+    s.shipping_delay_days,
+    s.absolute_schedule_variance_days,
+    s.shipping_efficiency_ratio,
 
-    src.order_total_sales,
-    src.order_total_profit,
-    src.order_total_quantity,
-    src.order_item_count,
-    src.order_profit_margin_pct,
+    s.late_delivery_risk,
+    s.is_late_delivery,
+    s.is_on_time_delivery,
+    s.delivery_performance,
+    s.delivery_delay_severity,
+    s.shipping_speed_segment,
 
-    src.staging_row_id,
-    src.source_file_name,
-    src.load_batch_id,
-    NOW(6)
-FROM (
-    SELECT ranked.*
-    FROM (
-        SELECT
-            s.*,
-            ROW_NUMBER() OVER (
-                PARTITION BY s.order_item_id
-                ORDER BY s.loaded_at DESC, s.staging_row_id DESC
-            ) AS rn
-        FROM stg_supply_chain AS s
-        WHERE s.order_item_id IS NOT NULL
-    ) AS ranked
-    WHERE ranked.rn = 1
-) AS src
+    s.order_total_sales,
+    s.order_total_profit,
+    s.order_total_quantity,
+    s.order_item_count,
+    s.order_profit_margin_pct,
 
-LEFT JOIN dim_customer AS dc
-    ON dc.customer_id = src.customer_id
+    s.customer_order_count,
+    s.customer_lifetime_sales,
+    s.customer_average_item_sales,
+    s.customer_lifetime_profit,
+    s.customer_tenure_days,
+    s.customer_frequency_segment,
 
-LEFT JOIN dim_product AS dp
-    ON dp.product_card_id = src.product_card_id
+    s.sales_value_tier,
+    s.margin_band,
+    s.discount_band,
+    s.requires_management_attention,
+    s.operational_risk_segment,
 
-LEFT JOIN dim_category AS dcat
-    ON dcat.category_id = src.category_id
-
-LEFT JOIN dim_date AS dod
-    ON dod.date_key = COALESCE(
-        src.order_date_key,
-        CAST(DATE_FORMAT(src.order_date, '%Y%m%d') AS UNSIGNED)
-    )
-
-LEFT JOIN dim_date AS dsd
-    ON dsd.date_key = COALESCE(
-        src.shipping_date_key,
-        CAST(DATE_FORMAT(src.shipping_date, '%Y%m%d') AS UNSIGNED)
-    )
-
-LEFT JOIN dim_shipping_mode AS dsm
-    ON dsm.shipping_mode = NULLIF(TRIM(src.shipping_mode), '')
-
-LEFT JOIN dim_geography AS dg
-    ON dg.geography_hash = SHA2(
+    s.source_file_name,
+    s.load_batch_id,
+    s.staging_row_id,
+    NOW(6) AS loaded_at
+FROM stg_supply_chain AS s
+LEFT JOIN dim_customer AS c
+    ON c.customer_id = s.customer_id
+LEFT JOIN dim_product AS p
+    ON p.product_card_id = s.product_card_id
+LEFT JOIN dim_category AS cat
+    ON cat.category_id = s.category_id
+LEFT JOIN dim_date AS od
+    ON od.full_date = DATE(s.order_date)
+LEFT JOIN dim_date AS sd
+    ON sd.full_date = DATE(s.shipping_date)
+LEFT JOIN dim_shipping_mode AS sm
+    ON sm.shipping_mode = s.shipping_mode
+LEFT JOIN dim_geography AS g
+    ON g.geography_natural_key = SHA2(
         CONCAT_WS(
             '|',
-            COALESCE(NULLIF(TRIM(src.market), ''), 'Unknown'),
-            COALESCE(NULLIF(TRIM(src.order_region), ''), 'Unknown'),
-            COALESCE(NULLIF(TRIM(src.order_country), ''), 'Unknown'),
-            COALESCE(NULLIF(TRIM(src.order_state), ''), 'Unknown'),
-            COALESCE(NULLIF(TRIM(src.order_city), ''), 'Unknown')
+            COALESCE(TRIM(s.market), 'Unknown'),
+            COALESCE(TRIM(s.order_region), 'Unknown'),
+            COALESCE(TRIM(s.order_country), 'Unknown'),
+            COALESCE(TRIM(s.order_state), 'Unknown'),
+            COALESCE(TRIM(s.order_city), 'Unknown'),
+            COALESCE(CAST(ROUND(s.latitude, 6) AS CHAR), 'Unknown'),
+            COALESCE(CAST(ROUND(s.longitude, 6) AS CHAR), 'Unknown')
         ),
         256
     )
+WHERE s.load_batch_id = @latest_batch_id;
 
-ON DUPLICATE KEY UPDATE
-    customer_key = VALUES(customer_key),
-    product_key = VALUES(product_key),
-    category_key = VALUES(category_key),
-    order_date_key = VALUES(order_date_key),
-    shipping_date_key = VALUES(shipping_date_key),
-    shipping_mode_key = VALUES(shipping_mode_key),
-    geography_key = VALUES(geography_key),
+SET @rows_inserted = ROW_COUNT();
 
-    order_id = VALUES(order_id),
-    order_customer_id = VALUES(order_customer_id),
-    order_item_cardprod_id = VALUES(order_item_cardprod_id),
-
-    payment_type = VALUES(payment_type),
-    order_status = VALUES(order_status),
-    delivery_status = VALUES(delivery_status),
-    delivery_performance = VALUES(delivery_performance),
-    profitability_status = VALUES(profitability_status),
-    operational_risk_segment = VALUES(operational_risk_segment),
-
-    order_item_quantity = VALUES(order_item_quantity),
-    sales = VALUES(sales),
-    gross_sales_before_discount = VALUES(gross_sales_before_discount),
-    order_item_discount = VALUES(order_item_discount),
-    order_item_discount_rate = VALUES(order_item_discount_rate),
-    discount_rate_pct = VALUES(discount_rate_pct),
-    discount_pct_calculated = VALUES(discount_pct_calculated),
-    order_item_product_price = VALUES(order_item_product_price),
-    order_item_total = VALUES(order_item_total),
-    order_profit = VALUES(order_profit),
-    order_profit_per_order = VALUES(order_profit_per_order),
-    order_item_profit_ratio = VALUES(order_item_profit_ratio),
-    profit_margin_pct = VALUES(profit_margin_pct),
-
-    days_for_shipping_real = VALUES(days_for_shipping_real),
-    days_for_shipment_scheduled = VALUES(days_for_shipment_scheduled),
-    shipping_delay_days = VALUES(shipping_delay_days),
-    absolute_schedule_variance_days = VALUES(absolute_schedule_variance_days),
-    shipping_efficiency_ratio = VALUES(shipping_efficiency_ratio),
-
-    late_delivery_risk = VALUES(late_delivery_risk),
-    is_late_delivery = VALUES(is_late_delivery),
-    is_on_time_delivery = VALUES(is_on_time_delivery),
-    is_profitable_item = VALUES(is_profitable_item),
-    is_loss_item = VALUES(is_loss_item),
-    requires_management_attention = VALUES(requires_management_attention),
-
-    delivery_delay_severity = VALUES(delivery_delay_severity),
-    shipping_speed_segment = VALUES(shipping_speed_segment),
-    sales_value_tier = VALUES(sales_value_tier),
-    margin_band = VALUES(margin_band),
-    discount_band = VALUES(discount_band),
-
-    order_total_sales = VALUES(order_total_sales),
-    order_total_profit = VALUES(order_total_profit),
-    order_total_quantity = VALUES(order_total_quantity),
-    order_item_count = VALUES(order_item_count),
-    order_profit_margin_pct = VALUES(order_profit_margin_pct),
-
-    source_staging_row_id = VALUES(source_staging_row_id),
-    source_file_name = VALUES(source_file_name),
-    load_batch_id = VALUES(load_batch_id),
-    warehouse_updated_at = CURRENT_TIMESTAMP(6);
-
-SET @fact_etl_activity_rows = ROW_COUNT();
-
-COMMIT;
-
-/* ---------------------------------------------------------------------------
-   4. POST-LOAD METRICS
-   --------------------------------------------------------------------------- */
-SET @staging_valid_rows = (
-    SELECT COUNT(DISTINCT order_item_id)
-    FROM stg_supply_chain
-    WHERE order_item_id IS NOT NULL
-);
-
-SET @fact_total_rows = (
+-- ============================================================================
+-- 6. CALCULATE POST-LOAD METRICS
+-- ============================================================================
+SET @fact_rows = (
     SELECT COUNT(*)
     FROM fact_order_item
 );
 
-SET @fact_rejected_rows = (
-    SELECT COUNT(*)
-    FROM stg_supply_chain
-    WHERE order_item_id IS NULL
+SET @fact_unique_order_items = (
+    SELECT COUNT(DISTINCT order_item_id)
+    FROM fact_order_item
 );
 
+SET @duplicate_rows = @fact_rows - @fact_unique_order_items;
+
+SET @unknown_dimension_keys = (
+    SELECT
+        SUM(
+            customer_key = 0
+            OR product_key = 0
+            OR category_key = 0
+            OR order_date_key = 0
+            OR shipping_date_key = 0
+            OR shipping_mode_key = 0
+            OR geography_key = 0
+        )
+    FROM fact_order_item
+);
+
+SET @load_status = CASE
+    WHEN
+        @fact_rows = @expected_rows
+        AND @fact_unique_order_items = @expected_rows
+        AND @duplicate_rows = 0
+        AND @unknown_dimension_keys = 0
+    THEN 'SUCCESS'
+    WHEN @fact_rows > 0
+    THEN 'WARNING'
+    ELSE 'FAILED'
+END;
+
+-- ============================================================================
+-- 7. UPDATE ETL AUDIT RECORD
+-- ============================================================================
 UPDATE etl_run_log
 SET
-    process_status = CASE
-        WHEN @fact_total_rows = @staging_valid_rows THEN 'SUCCESS'
-        ELSE 'WARNING'
-    END,
-    rows_read = (SELECT COUNT(*) FROM stg_supply_chain),
-    rows_inserted = @fact_total_rows,
-    rows_rejected = @fact_rejected_rows,
+    process_status = @load_status,
+    rows_read = @expected_rows,
+    rows_inserted = @rows_inserted,
+    rows_rejected = @expected_rows - @rows_inserted,
     completed_at = NOW(6),
     error_message = CASE
-        WHEN @fact_total_rows = @staging_valid_rows THEN NULL
+        WHEN @load_status = 'SUCCESS' THEN NULL
         ELSE CONCAT(
-            'Expected ',
-            @staging_valid_rows,
-            ' distinct non-null order_item_id rows but fact contains ',
-            @fact_total_rows,
-            ' rows.'
+            'fact_rows=', @fact_rows,
+            '; unique_order_items=', @fact_unique_order_items,
+            '; duplicate_rows=', @duplicate_rows,
+            '; rows_with_unknown_dimension_key=', @unknown_dimension_keys
         )
     END
 WHERE etl_run_id = @etl_run_id;
 
-/* ---------------------------------------------------------------------------
-   5. ROW-COUNT RECONCILIATION
-   Expected target for this dataset is approximately 180,519 rows.
-   --------------------------------------------------------------------------- */
-SELECT
-    (SELECT COUNT(*) FROM stg_supply_chain) AS staging_rows,
-    (SELECT COUNT(DISTINCT order_item_id)
-     FROM stg_supply_chain
-     WHERE order_item_id IS NOT NULL) AS expected_fact_rows,
-    (SELECT COUNT(*) FROM fact_order_item) AS actual_fact_rows,
-    (SELECT COUNT(*)
-     FROM stg_supply_chain
-     WHERE order_item_id IS NULL) AS rejected_null_business_keys,
-    CASE
-        WHEN
-            (SELECT COUNT(*) FROM fact_order_item)
-            =
-            (SELECT COUNT(DISTINCT order_item_id)
-             FROM stg_supply_chain
-             WHERE order_item_id IS NOT NULL)
-        THEN 'PASS'
-        ELSE 'FAIL'
-    END AS reconciliation_status;
-
-/* ---------------------------------------------------------------------------
-   6. FOREIGN-KEY AND UNKNOWN-MEMBER COVERAGE
-   Key 0 is valid, but high counts indicate unresolved dimension lookups.
-   --------------------------------------------------------------------------- */
-SELECT
-    'customer_key' AS dimension_key,
-    SUM(customer_key = 0) AS unknown_rows,
-    ROUND(SUM(customer_key = 0) / NULLIF(COUNT(*), 0) * 100, 4) AS unknown_pct
-FROM fact_order_item
-
-UNION ALL
-
-SELECT
-    'product_key',
-    SUM(product_key = 0),
-    ROUND(SUM(product_key = 0) / NULLIF(COUNT(*), 0) * 100, 4)
-FROM fact_order_item
-
-UNION ALL
-
-SELECT
-    'category_key',
-    SUM(category_key = 0),
-    ROUND(SUM(category_key = 0) / NULLIF(COUNT(*), 0) * 100, 4)
-FROM fact_order_item
-
-UNION ALL
-
-SELECT
-    'order_date_key',
-    SUM(order_date_key = 0),
-    ROUND(SUM(order_date_key = 0) / NULLIF(COUNT(*), 0) * 100, 4)
-FROM fact_order_item
-
-UNION ALL
-
-SELECT
-    'shipping_date_key',
-    SUM(shipping_date_key = 0),
-    ROUND(SUM(shipping_date_key = 0) / NULLIF(COUNT(*), 0) * 100, 4)
-FROM fact_order_item
-
-UNION ALL
-
-SELECT
-    'shipping_mode_key',
-    SUM(shipping_mode_key = 0),
-    ROUND(SUM(shipping_mode_key = 0) / NULLIF(COUNT(*), 0) * 100, 4)
-FROM fact_order_item
-
-UNION ALL
-
-SELECT
-    'geography_key',
-    SUM(geography_key = 0),
-    ROUND(SUM(geography_key = 0) / NULLIF(COUNT(*), 0) * 100, 4)
-FROM fact_order_item;
-
-/* ---------------------------------------------------------------------------
-   7. BUSINESS-MEASURE RECONCILIATION
-   Small differences may occur only from decimal rounding.
-   --------------------------------------------------------------------------- */
-SELECT
-    'sales' AS metric,
-    ROUND((SELECT SUM(sales) FROM stg_supply_chain), 4) AS staging_value,
-    ROUND((SELECT SUM(sales) FROM fact_order_item), 4) AS fact_value,
-    ROUND(
-        (SELECT SUM(sales) FROM fact_order_item)
-        -
-        (SELECT SUM(sales) FROM stg_supply_chain),
-        4
-    ) AS difference
-
-UNION ALL
-
-SELECT
-    'order_profit',
-    ROUND((SELECT SUM(order_profit) FROM stg_supply_chain), 4),
-    ROUND((SELECT SUM(order_profit) FROM fact_order_item), 4),
-    ROUND(
-        (SELECT SUM(order_profit) FROM fact_order_item)
-        -
-        (SELECT SUM(order_profit) FROM stg_supply_chain),
-        4
-    )
-
-UNION ALL
-
-SELECT
-    'order_item_discount',
-    ROUND((SELECT SUM(order_item_discount) FROM stg_supply_chain), 4),
-    ROUND((SELECT SUM(order_item_discount) FROM fact_order_item), 4),
-    ROUND(
-        (SELECT SUM(order_item_discount) FROM fact_order_item)
-        -
-        (SELECT SUM(order_item_discount) FROM stg_supply_chain),
-        4
-    )
-
-UNION ALL
-
-SELECT
-    'order_item_quantity',
-    ROUND((SELECT SUM(order_item_quantity) FROM stg_supply_chain), 4),
-    ROUND((SELECT SUM(order_item_quantity) FROM fact_order_item), 4),
-    ROUND(
-        (SELECT SUM(order_item_quantity) FROM fact_order_item)
-        -
-        (SELECT SUM(order_item_quantity) FROM stg_supply_chain),
-        4
-    );
-
-/* ---------------------------------------------------------------------------
-   8. DUPLICATE AND REFERENTIAL-INTEGRITY CHECKS
-   All results should be zero.
-   --------------------------------------------------------------------------- */
-SELECT
-    'duplicate_order_item_id_groups' AS check_name,
-    COUNT(*) AS failed_groups
-FROM (
-    SELECT order_item_id
-    FROM fact_order_item
-    GROUP BY order_item_id
-    HAVING COUNT(*) > 1
-) AS duplicate_fact_items
-
-UNION ALL
-
-SELECT
-    'orphan_customer_keys',
-    COUNT(*)
-FROM fact_order_item AS f
-LEFT JOIN dim_customer AS d
-    ON d.customer_key = f.customer_key
-WHERE d.customer_key IS NULL
-
-UNION ALL
-
-SELECT
-    'orphan_product_keys',
-    COUNT(*)
-FROM fact_order_item AS f
-LEFT JOIN dim_product AS d
-    ON d.product_key = f.product_key
-WHERE d.product_key IS NULL
-
-UNION ALL
-
-SELECT
-    'orphan_category_keys',
-    COUNT(*)
-FROM fact_order_item AS f
-LEFT JOIN dim_category AS d
-    ON d.category_key = f.category_key
-WHERE d.category_key IS NULL
-
-UNION ALL
-
-SELECT
-    'orphan_order_date_keys',
-    COUNT(*)
-FROM fact_order_item AS f
-LEFT JOIN dim_date AS d
-    ON d.date_key = f.order_date_key
-WHERE d.date_key IS NULL
-
-UNION ALL
-
-SELECT
-    'orphan_shipping_date_keys',
-    COUNT(*)
-FROM fact_order_item AS f
-LEFT JOIN dim_date AS d
-    ON d.date_key = f.shipping_date_key
-WHERE d.date_key IS NULL
-
-UNION ALL
-
-SELECT
-    'orphan_shipping_mode_keys',
-    COUNT(*)
-FROM fact_order_item AS f
-LEFT JOIN dim_shipping_mode AS d
-    ON d.shipping_mode_key = f.shipping_mode_key
-WHERE d.shipping_mode_key IS NULL
-
-UNION ALL
-
-SELECT
-    'orphan_geography_keys',
-    COUNT(*)
-FROM fact_order_item AS f
-LEFT JOIN dim_geography AS d
-    ON d.geography_key = f.geography_key
-WHERE d.geography_key IS NULL;
-
-/* ---------------------------------------------------------------------------
-   9. FINAL READINESS STATUS
-   --------------------------------------------------------------------------- */
+-- ============================================================================
+-- 8. FACT GRAIN AND VOLUME VALIDATION
+-- ============================================================================
 SELECT
     COUNT(*) AS fact_rows,
-    COUNT(DISTINCT order_item_id) AS distinct_order_item_ids,
-    COUNT(DISTINCT order_id) AS distinct_orders,
-    ROUND(SUM(sales), 2) AS total_sales,
-    ROUND(SUM(order_profit), 2) AS total_profit,
-    ROUND(AVG(is_late_delivery) * 100, 2) AS late_delivery_rate_pct,
+    COUNT(DISTINCT order_item_id) AS unique_order_item_ids,
+    COUNT(*) - COUNT(DISTINCT order_item_id) AS duplicate_rows,
     CASE
-        WHEN COUNT(*) = COUNT(DISTINCT order_item_id)
-         AND COUNT(*) >= 180000
-         AND SUM(customer_key = 0) = 0
-         AND SUM(product_key = 0) = 0
-         AND SUM(category_key = 0) = 0
-         AND SUM(order_date_key = 0) = 0
-         AND SUM(shipping_date_key = 0) = 0
-         AND SUM(shipping_mode_key = 0) = 0
-         AND SUM(geography_key = 0) = 0
-        THEN 'READY'
-        WHEN COUNT(*) = COUNT(DISTINCT order_item_id)
-         AND COUNT(*) >= 180000
-        THEN 'READY WITH WARNINGS'
-        ELSE 'NOT READY'
-    END AS fact_readiness_status
+        WHEN
+            COUNT(*) = @expected_rows
+            AND COUNT(DISTINCT order_item_id) = @expected_rows
+        THEN 'PASS'
+        ELSE 'FAIL'
+    END AS grain_and_volume_status
 FROM fact_order_item;
 
-/* Latest ETL audit record. */
+-- ============================================================================
+-- 9. DIMENSION KEY VALIDATION
+-- ============================================================================
+SELECT
+    SUM(customer_key = 0) AS unknown_customer_keys,
+    SUM(product_key = 0) AS unknown_product_keys,
+    SUM(category_key = 0) AS unknown_category_keys,
+    SUM(order_date_key = 0) AS unknown_order_date_keys,
+    SUM(shipping_date_key = 0) AS unknown_shipping_date_keys,
+    SUM(shipping_mode_key = 0) AS unknown_shipping_mode_keys,
+    SUM(geography_key = 0) AS unknown_geography_keys,
+    CASE
+        WHEN
+            SUM(customer_key = 0) = 0
+            AND SUM(product_key = 0) = 0
+            AND SUM(category_key = 0) = 0
+            AND SUM(order_date_key = 0) = 0
+            AND SUM(shipping_date_key = 0) = 0
+            AND SUM(shipping_mode_key = 0) = 0
+            AND SUM(geography_key = 0) = 0
+        THEN 'PASS'
+        ELSE 'REVIEW'
+    END AS dimension_key_status
+FROM fact_order_item;
+
+-- ============================================================================
+-- 10. FOREIGN-KEY ORPHAN CHECK
+-- Expected result: 0 for every orphan count.
+-- ============================================================================
+SELECT
+    SUM(c.customer_key IS NULL) AS orphan_customer_keys,
+    SUM(p.product_key IS NULL) AS orphan_product_keys,
+    SUM(cat.category_key IS NULL) AS orphan_category_keys,
+    SUM(od.date_key IS NULL) AS orphan_order_date_keys,
+    SUM(sd.date_key IS NULL) AS orphan_shipping_date_keys,
+    SUM(sm.shipping_mode_key IS NULL) AS orphan_shipping_mode_keys,
+    SUM(g.geography_key IS NULL) AS orphan_geography_keys
+FROM fact_order_item AS f
+LEFT JOIN dim_customer AS c
+    ON c.customer_key = f.customer_key
+LEFT JOIN dim_product AS p
+    ON p.product_key = f.product_key
+LEFT JOIN dim_category AS cat
+    ON cat.category_key = f.category_key
+LEFT JOIN dim_date AS od
+    ON od.date_key = f.order_date_key
+LEFT JOIN dim_date AS sd
+    ON sd.date_key = f.shipping_date_key
+LEFT JOIN dim_shipping_mode AS sm
+    ON sm.shipping_mode_key = f.shipping_mode_key
+LEFT JOIN dim_geography AS g
+    ON g.geography_key = f.geography_key;
+
+-- ============================================================================
+-- 11. STAGING-TO-FACT FINANCIAL RECONCILIATION
+-- ============================================================================
+SELECT
+    s.staging_rows,
+    f.fact_rows,
+    ROUND(s.staging_sales, 2) AS staging_sales,
+    ROUND(f.fact_sales, 2) AS fact_sales,
+    ROUND(f.fact_sales - s.staging_sales, 2) AS sales_difference,
+    ROUND(s.staging_profit, 2) AS staging_profit,
+    ROUND(f.fact_profit, 2) AS fact_profit,
+    ROUND(f.fact_profit - s.staging_profit, 2) AS profit_difference,
+    CASE
+        WHEN
+            s.staging_rows = f.fact_rows
+            AND ABS(f.fact_sales - s.staging_sales) <= 0.01
+            AND ABS(f.fact_profit - s.staging_profit) <= 0.01
+        THEN 'PASS'
+        ELSE 'FAIL'
+    END AS reconciliation_status
+FROM (
+    SELECT
+        COUNT(*) AS staging_rows,
+        SUM(sales) AS staging_sales,
+        SUM(order_profit_per_order) AS staging_profit
+    FROM stg_supply_chain
+    WHERE load_batch_id = @latest_batch_id
+) AS s
+CROSS JOIN (
+    SELECT
+        COUNT(*) AS fact_rows,
+        SUM(sales) AS fact_sales,
+        SUM(order_profit_per_order) AS fact_profit
+    FROM fact_order_item
+) AS f;
+
+-- ============================================================================
+-- 12. BUSINESS SUMMARY
+-- ============================================================================
+SELECT
+    COUNT(*) AS order_item_rows,
+    COUNT(DISTINCT order_id) AS distinct_orders,
+    COUNT(DISTINCT customer_key) AS represented_customer_keys,
+    COUNT(DISTINCT product_key) AS represented_product_keys,
+    COUNT(DISTINCT category_key) AS represented_category_keys,
+    ROUND(SUM(sales), 2) AS total_sales,
+    ROUND(SUM(order_profit_per_order), 2) AS total_profit,
+    ROUND(
+        SUM(order_profit_per_order)
+        / NULLIF(SUM(sales), 0)
+        * 100,
+        2
+    ) AS overall_profit_margin_pct,
+    ROUND(AVG(days_for_shipping_real), 2)
+        AS average_actual_shipping_days,
+    ROUND(AVG(is_late_delivery) * 100, 2)
+        AS late_delivery_rate_pct
+FROM fact_order_item;
+
+-- ============================================================================
+-- 13. SAMPLE STAR-SCHEMA JOIN
+-- ============================================================================
+SELECT
+    f.order_item_id,
+    f.order_id,
+    od.full_date AS order_date,
+    sd.full_date AS shipping_date,
+    c.customer_segment,
+    p.product_name,
+    cat.category_name,
+    sm.shipping_mode,
+    g.market,
+    g.order_country,
+    f.sales,
+    f.order_profit_per_order,
+    f.is_late_delivery
+FROM fact_order_item AS f
+JOIN dim_customer AS c
+    ON c.customer_key = f.customer_key
+JOIN dim_product AS p
+    ON p.product_key = f.product_key
+JOIN dim_category AS cat
+    ON cat.category_key = f.category_key
+JOIN dim_date AS od
+    ON od.date_key = f.order_date_key
+JOIN dim_date AS sd
+    ON sd.date_key = f.shipping_date_key
+JOIN dim_shipping_mode AS sm
+    ON sm.shipping_mode_key = f.shipping_mode_key
+JOIN dim_geography AS g
+    ON g.geography_key = f.geography_key
+ORDER BY f.fact_order_item_key
+LIMIT 20;
+
+-- ============================================================================
+-- 14. FINAL FACT-LOAD DECISION
+-- ============================================================================
+SELECT
+    @fact_rows AS fact_rows,
+    @fact_unique_order_items AS unique_order_item_ids,
+    @duplicate_rows AS duplicate_rows,
+    @unknown_dimension_keys AS rows_with_unknown_dimension_key,
+    @load_status AS etl_status,
+    CASE
+        WHEN
+            @fact_rows = @expected_rows
+            AND @fact_unique_order_items = @expected_rows
+            AND @duplicate_rows = 0
+            AND @unknown_dimension_keys = 0
+        THEN 'FACT LOAD COMPLETE'
+        ELSE 'REVIEW FACT LOAD'
+    END AS final_fact_readiness;
+
 SELECT *
 FROM etl_run_log
 WHERE etl_run_id = @etl_run_id;
+
+-- Restore the previous Safe Updates setting.
+SET SQL_SAFE_UPDATES = @previous_sql_safe_updates;
